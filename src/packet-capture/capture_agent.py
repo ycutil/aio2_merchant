@@ -130,7 +130,8 @@ class CaptureAgent:
         self.dump_mode = dump_mode
         self.detector = TrafficDetector()
         self.buffers: dict[str, PacketBuffer] = defaultdict(PacketBuffer)
-        self.ws: Optional[websockets.WebSocketClientProtocol] = None
+        self.ws = None
+        self._ws_connected = False
         self.packet_queue: asyncio.Queue = asyncio.Queue(maxsize=10000)
         self.stats = {
             "captured": 0,
@@ -201,7 +202,7 @@ class CaptureAgent:
         """프레임을 WebSocket으로 전송"""
         while self._running:
             try:
-                if self.ws is None or self.ws.closed:
+                if not self._ws_connected:
                     await self._connect()
 
                 frame = await asyncio.wait_for(
@@ -211,38 +212,56 @@ class CaptureAgent:
                 if self.dump_mode:
                     self._dump_frame(frame)
                 else:
-                    # 타임스탬프 + 프레임 데이터 전송
                     header = struct.pack("<d", time.time())
                     await self.ws.send(header + frame)
                     self.stats["sent"] += 1
 
             except asyncio.TimeoutError:
                 continue
-            except websockets.exceptions.ConnectionClosed:
-                logger.warning("WebSocket 연결 끊김 — 재접속 시도")
-                self.ws = None
-                await asyncio.sleep(2)
             except Exception as e:
-                logger.error(f"전송 오류: {e}")
-                self.stats["errors"] += 1
-                await asyncio.sleep(1)
+                err_name = type(e).__name__
+                if "ConnectionClosed" in err_name or "ConnectionError" in err_name:
+                    logger.warning("WebSocket disconnected — reconnecting")
+                    self._ws_connected = False
+                    self.ws = None
+                    await asyncio.sleep(2)
+                else:
+                    logger.error(f"Send error: {err_name}: {e}")
+                    self._ws_connected = False
+                    self.ws = None
+                    self.stats["errors"] += 1
+                    await asyncio.sleep(2)
 
     async def _connect(self):
-        """WebSocket 서버에 접속 (ws:// 또는 wss:// 자동 처리)"""
+        """WebSocket 서버에 접속 (ws:// 또는 wss:// 자동 처리, v13/v14 호환)"""
         try:
-            extra = {}
+            kwargs = {}
+
+            # ngrok header
             if "ngrok" in self.server_url or "wss://" in self.server_url:
-                extra["additional_headers"] = {
+                kwargs["additional_headers"] = {
                     "ngrok-skip-browser-warning": "true"
                 }
-            self.ws = await websockets.connect(
-                self.server_url,
-                max_size=4 * 1024 * 1024,
-                **extra,
-            )
-            logger.info(f"서버 연결 성공: {self.server_url}")
+
+            # websockets v14+ uses max_size differently
+            try:
+                self.ws = await websockets.connect(
+                    self.server_url,
+                    max_size=4 * 1024 * 1024,
+                    **kwargs,
+                )
+            except TypeError:
+                # fallback for API changes
+                kwargs.pop("additional_headers", None)
+                self.ws = await websockets.connect(
+                    self.server_url,
+                )
+
+            self._ws_connected = True
+            logger.info(f"Connected: {self.server_url}")
         except Exception as e:
-            logger.error(f"서버 연결 실패: {e}")
+            logger.error(f"Connection failed: {e}")
+            self._ws_connected = False
             await asyncio.sleep(5)
 
     def _dump_frame(self, frame: bytes):
