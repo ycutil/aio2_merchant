@@ -27,6 +27,7 @@ from packet_parser import (
     BrokerPacketAnalyzer,
     parse_frame,
     parse_compressed_packet,
+    read_varint,
     ParsedPacket,
 )
 
@@ -37,12 +38,91 @@ logging.basicConfig(
 logger = logging.getLogger("aion2-server")
 
 
+MAGIC = bytes([0x06, 0x00, 0x36])
+
+
+class StreamFramer:
+    """Server-side VarInt length framing with 06 00 36 resync"""
+
+    def __init__(self):
+        self.buf = bytearray()
+        self.synced = False
+
+    def feed(self, data: bytes) -> list[bytes]:
+        self.buf.extend(data)
+        if len(self.buf) > 4 * 1024 * 1024:
+            self.buf.clear()
+            self.synced = False
+            return []
+
+        frames = []
+
+        if not self.synced:
+            idx = self.buf.find(MAGIC)
+            if idx < 0:
+                if len(self.buf) > 2:
+                    self.buf = self.buf[-2:]
+                return []
+            # 06 00 36 is itself a VarInt(6) packet — consume it fully
+            # VarInt val=6, len=1, realLength=6+1-4=3, total=1+3=4
+            start = idx
+            self.buf = self.buf[start:]  # align to the 06 byte
+            self.synced = True
+
+        while len(self.buf) > 0:
+            vr = self._read_varint(0)
+            if vr is None:
+                break
+
+            var_val, var_len = vr
+            real_length = var_val + var_len - 4
+
+            if real_length < 0 or real_length > 2 * 1024 * 1024:
+                # desync — scan for next 06 00 36
+                self.synced = False
+                idx = self.buf.find(MAGIC, 1)
+                if idx < 0:
+                    self.buf = self.buf[-2:] if len(self.buf) > 2 else self.buf
+                    break
+                self.buf = self.buf[idx:]
+                self.synced = True
+                continue
+
+            total = var_len + real_length
+            if total > len(self.buf):
+                break  # wait for more data
+
+            frame = bytes(self.buf[var_len:var_len + real_length])
+            self.buf = self.buf[total:]
+
+            if len(frame) >= 2:
+                frames.append(frame)
+
+        return frames
+
+    def _read_varint(self, offset: int):
+        value = 0
+        shift = 0
+        count = 0
+        while offset + count < len(self.buf):
+            b = self.buf[offset + count]
+            count += 1
+            value |= (b & 0x7F) << shift
+            if (b & 0x80) == 0:
+                return value, count
+            shift += 7
+            if shift > 35:
+                return None
+        return None
+
+
 class RealtimeAnalyzer:
     """실시간 패킷 분석 엔진"""
 
     def __init__(self):
         self.router = PacketRouter()
         self.broker_analyzer = BrokerPacketAnalyzer()
+        self.framer = StreamFramer()
         self.stats = {
             "total_frames": 0,
             "total_packets": 0,
@@ -50,14 +130,19 @@ class RealtimeAnalyzer:
             "last_packet_time": 0,
             "opcode_freq": defaultdict(int),
         }
-        self.recent_packets: list[dict] = []  # 최근 100개 패킷
+        self.recent_packets: list[dict] = []
         self.broker_candidates: dict = {}
         self.web_clients: set[web.WebSocketResponse] = set()
 
-    def process_frame(self, timestamp: float, frame: bytes):
-        self.stats["total_frames"] += 1
-        self.stats["last_packet_time"] = timestamp
+    def process_raw(self, timestamp: float, raw_tcp: bytes):
+        """Process raw TCP payload — does framing server-side"""
+        frames = self.framer.feed(raw_tcp)
+        for frame in frames:
+            self.stats["total_frames"] += 1
+            self.stats["last_packet_time"] = timestamp
+            self._parse_and_route(timestamp, frame)
 
+    def _parse_and_route(self, timestamp: float, frame: bytes):
         parsed = parse_frame(frame)
         if parsed is None:
             return
@@ -156,8 +241,8 @@ class Server:
             async for msg in ws:
                 if msg.type == web.WSMsgType.BINARY and len(msg.data) > 8:
                     timestamp = struct.unpack("<d", msg.data[:8])[0]
-                    frame = msg.data[8:]
-                    self.analyzer.process_frame(timestamp, frame)
+                    raw_tcp = msg.data[8:]
+                    self.analyzer.process_raw(timestamp, raw_tcp)
                 elif msg.type == web.WSMsgType.TEXT:
                     try:
                         cmd = json.loads(msg.data)

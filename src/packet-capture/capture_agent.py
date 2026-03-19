@@ -237,18 +237,12 @@ class CaptureAgent:
 
         self.stats["captured"] += 1
 
-        # 버퍼에 추가
-        stream_key = f"{ip.src}:{tcp.sport}->{ip.dst}:{tcp.dport}"
-        self.buffers[stream_key].append(payload)
-
-        # 프레임 추출
-        frames = self.buffers[stream_key].extract_frames()
-        for frame in frames:
+        # Raw TCP payload — framing is done server-side
+        try:
+            self.packet_queue.put_nowait(payload)
             self.stats["frames"] += 1
-            try:
-                self.packet_queue.put_nowait(frame)
-            except asyncio.QueueFull:
-                self.stats["errors"] += 1
+        except asyncio.QueueFull:
+            self.stats["errors"] += 1
 
     async def _send_loop(self):
         """프레임을 WebSocket으로 전송"""
