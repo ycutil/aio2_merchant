@@ -92,33 +92,85 @@ class TrafficDetector:
         return src_port == self.locked_port or dst_port == self.locked_port
 
 
+def read_varint(data: bytes, offset: int = 0):
+    """Protobuf VarInt (LEB128) decode — returns (value, bytes_consumed)"""
+    value = 0
+    shift = 0
+    count = 0
+    while offset + count < len(data):
+        byte_val = data[offset + count]
+        count += 1
+        value |= (byte_val & 0x7F) << shift
+        if (byte_val & 0x80) == 0:
+            return value, count
+        shift += 7
+        if shift > 35:
+            return None, 0
+    return None, 0  # incomplete
+
+
 class PacketBuffer:
-    """TCP 스트림 버퍼 — 매직 바이트로 프레임 분리"""
+    """TCP stream buffer — VarInt length-based framing with 06 00 36 resync"""
 
     def __init__(self, max_size: int = 2 * 1024 * 1024):
         self.buffer = bytearray()
         self.max_size = max_size
+        self._synced = False
 
     def append(self, data: bytes):
         self.buffer.extend(data)
         if len(self.buffer) > self.max_size:
-            logger.warning("버퍼 오버플로 — 초기화")
+            logger.warning("buffer overflow — reset")
             self.buffer.clear()
+            self._synced = False
+
+    def _try_sync(self):
+        """Find 06 00 36 marker to synchronize stream position"""
+        idx = self.buffer.find(MAGIC_BYTES)
+        if idx >= 0:
+            # Position right after the magic marker
+            self.buffer = self.buffer[idx + len(MAGIC_BYTES):]
+            self._synced = True
+            return True
+        # Keep last 2 bytes in case magic is split across TCP segments
+        if len(self.buffer) > 2:
+            self.buffer = self.buffer[-2:]
+        return False
 
     def extract_frames(self) -> list[bytes]:
         frames = []
-        data = bytes(self.buffer)
-        parts = data.split(MAGIC_BYTES)
 
-        if len(parts) <= 1:
-            return frames
+        if not self._synced:
+            if not self._try_sync():
+                return frames
 
-        # 마지막 부분은 불완전할 수 있으므로 버퍼에 유지
-        for part in parts[:-1]:
-            if len(part) > 2:  # 최소 opcode 2바이트
-                frames.append(part)
+        while len(self.buffer) > 0:
+            # Read VarInt packet length
+            var_val, var_len = read_varint(self.buffer, 0)
+            if var_val is None or var_len == 0:
+                break  # incomplete varint
 
-        self.buffer = bytearray(parts[-1])
+            # TK formula: realLength = varIntValue + varIntEncodedLength - 4
+            real_length = var_val + var_len - 4
+            if real_length <= 0 or real_length > 1024 * 1024:
+                # Bad length — desync, try to resync
+                logger.debug(f"bad frame len={real_length}, resyncing")
+                self._synced = False
+                if not self._try_sync():
+                    break
+                continue
+
+            total = var_len + real_length
+            if total > len(self.buffer):
+                break  # incomplete packet, wait for more data
+
+            # Extract frame body (skip varint header)
+            frame = bytes(self.buffer[var_len:var_len + real_length])
+            self.buffer = self.buffer[total:]
+
+            if len(frame) >= 2:
+                frames.append(frame)
+
         return frames
 
 
