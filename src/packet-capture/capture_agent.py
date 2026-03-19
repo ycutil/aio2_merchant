@@ -102,7 +102,6 @@ class CaptureAgent:
         self.server_url = server_url
         self.dump_mode = dump_mode
         self.detector = TrafficDetector()
-        self.buffers: dict[str, PacketBuffer] = defaultdict(PacketBuffer)
         self.ws = None
         self._ws_connected = False
         self.packet_queue: asyncio.Queue = asyncio.Queue(maxsize=10000)
