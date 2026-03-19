@@ -1,11 +1,13 @@
 """
 Aion 2 실시간 패킷 수신/분석 서버 (Mac)
 
-Windows capture_agent.py → WebSocket → 이 서버 → 실시간 파싱 → 웹 대시보드
+Windows capture_agent.py → WebSocket /capture → 이 서버 → 실시간 파싱 → 웹 대시보드
+
+단일 포트로 운영 — ngrok 터널 1개로 외부 PC 연결 가능
 
 사용법:
-  pip install websockets aiohttp lz4
-  python realtime_server.py --port 8765 --web-port 8080
+  pip install aiohttp lz4
+  python realtime_server.py --port 8080
 """
 
 import asyncio
@@ -18,7 +20,6 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Optional
 
-import websockets
 from aiohttp import web
 
 from packet_parser import (
@@ -135,45 +136,60 @@ class RealtimeAnalyzer:
 
 
 class Server:
-    """WebSocket 수신 + HTTP 대시보드 서버"""
+    """단일 포트 서버 — 캡처 수신 + 대시보드 + API 통합"""
 
-    def __init__(self, ws_port: int, web_port: int):
-        self.ws_port = ws_port
-        self.web_port = web_port
+    def __init__(self, port: int):
+        self.port = port
         self.analyzer = RealtimeAnalyzer()
         self.capture_connected = False
 
-    # ── WebSocket: 캡처 에이전트 연결 ──
+    # ── /capture: 캡처 에이전트 WebSocket ──
 
-    async def handle_capture(self, websocket):
-        addr = websocket.remote_address
-        logger.info(f"캡처 에이전트 연결: {addr}")
+    async def handle_capture(self, request):
+        ws = web.WebSocketResponse(max_msg_size=4 * 1024 * 1024)
+        await ws.prepare(request)
+        peer = request.remote
+        logger.info(f"캡처 에이전트 연결: {peer}")
         self.capture_connected = True
 
         try:
-            async for message in websocket:
-                if isinstance(message, bytes) and len(message) > 8:
-                    timestamp = struct.unpack("<d", message[:8])[0]
-                    frame = message[8:]
+            async for msg in ws:
+                if msg.type == web.WSMsgType.BINARY and len(msg.data) > 8:
+                    timestamp = struct.unpack("<d", msg.data[:8])[0]
+                    frame = msg.data[8:]
                     self.analyzer.process_frame(timestamp, frame)
-                elif isinstance(message, str):
+                elif msg.type == web.WSMsgType.TEXT:
                     try:
-                        cmd = json.loads(message)
+                        cmd = json.loads(msg.data)
                         if cmd.get("type") == "event":
                             self.analyzer.mark_event(cmd["event"])
                     except json.JSONDecodeError:
                         pass
-        except websockets.exceptions.ConnectionClosed:
-            logger.warning(f"캡처 에이전트 연결 끊김: {addr}")
+                elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR):
+                    break
+        except Exception as e:
+            logger.warning(f"캡처 에이전트 오류: {e}")
         finally:
             self.capture_connected = False
+            logger.warning(f"캡처 에이전트 연결 끊김: {peer}")
 
-    async def start_ws_server(self):
-        logger.info(f"캡처 수신 WebSocket: ws://0.0.0.0:{self.ws_port}")
-        async with websockets.serve(self.handle_capture, "0.0.0.0", self.ws_port):
-            await asyncio.Future()
+        return ws
 
-    # ── HTTP: 웹 대시보드 ──
+    # ── /ws: 대시보드 실시간 WebSocket ──
+
+    async def handle_ws_dashboard(self, request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        self.analyzer.web_clients.add(ws)
+        logger.info(f"대시보드 클라이언트 연결 (총 {len(self.analyzer.web_clients)})")
+        try:
+            async for msg in ws:
+                pass
+        finally:
+            self.analyzer.web_clients.discard(ws)
+        return ws
+
+    # ── HTTP 핸들러 ──
 
     async def handle_index(self, request):
         return web.Response(text=DASHBOARD_HTML, content_type="text/html")
@@ -198,52 +214,45 @@ class Server:
             },
         })
 
-    async def handle_ws_dashboard(self, request):
-        ws = web.WebSocketResponse()
-        await ws.prepare(request)
-        self.analyzer.web_clients.add(ws)
-        logger.info(f"대시보드 클라이언트 연결 (총 {len(self.analyzer.web_clients)})")
-        try:
-            async for msg in ws:
-                pass  # 대시보드는 수신만
-        finally:
-            self.analyzer.web_clients.discard(ws)
-        return ws
+    # ── 주기적 로그 ──
 
-    async def start_web_server(self):
+    async def stats_loop(self, app):
+        try:
+            while True:
+                await asyncio.sleep(30)
+                s = self.analyzer.get_status()
+                logger.info(
+                    f"[STATS] 프레임={s['total_frames']} "
+                    f"패킷={s['total_packets']} "
+                    f"속도={s['packets_per_sec']}/s "
+                    f"opcode={s['unique_opcodes']}종 "
+                    f"캡처={'연결' if self.capture_connected else '대기'}"
+                )
+        except asyncio.CancelledError:
+            pass
+
+    async def on_startup(self, app):
+        app["stats_task"] = asyncio.create_task(self.stats_loop(app))
+
+    async def on_cleanup(self, app):
+        app["stats_task"].cancel()
+        await app["stats_task"]
+
+    def run(self):
         app = web.Application()
         app.router.add_get("/", self.handle_index)
+        app.router.add_get("/capture", self.handle_capture)
+        app.router.add_get("/ws", self.handle_ws_dashboard)
         app.router.add_get("/api/status", self.handle_status)
         app.router.add_get("/api/packets", self.handle_packets)
         app.router.add_post("/api/event", self.handle_event)
-        app.router.add_get("/ws", self.handle_ws_dashboard)
+        app.on_startup.append(self.on_startup)
+        app.on_cleanup.append(self.on_cleanup)
 
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", self.web_port)
-        await site.start()
-        logger.info(f"웹 대시보드: http://0.0.0.0:{self.web_port}")
-
-    # ── 주기적 로그 ──
-
-    async def stats_loop(self):
-        while True:
-            await asyncio.sleep(30)
-            s = self.analyzer.get_status()
-            logger.info(
-                f"[STATS] 프레임={s['total_frames']} "
-                f"패킷={s['total_packets']} "
-                f"속도={s['packets_per_sec']}/s "
-                f"opcode={s['unique_opcodes']}종 "
-                f"캡처={'연결' if self.capture_connected else '대기'}"
-            )
-
-    async def run(self):
-        await asyncio.gather(
-            self.start_ws_server(),
-            self.start_web_server(),
-            self.stats_loop(),
-        )
+        logger.info(f"서버 시작: http://0.0.0.0:{self.port}")
+        logger.info(f"  대시보드:  http://0.0.0.0:{self.port}/")
+        logger.info(f"  캡처 수신: ws://0.0.0.0:{self.port}/capture")
+        web.run_app(app, host="0.0.0.0", port=self.port, print=None)
 
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -409,12 +418,11 @@ pollStatus();
 
 def main():
     parser = argparse.ArgumentParser(description="Aion 2 실시간 패킷 수신 서버")
-    parser.add_argument("--port", type=int, default=8765, help="캡처 에이전트 수신 포트 (기본: 8765)")
-    parser.add_argument("--web-port", type=int, default=8080, help="웹 대시보드 포트 (기본: 8080)")
+    parser.add_argument("--port", type=int, default=8080, help="서버 포트 (기본: 8080)")
     args = parser.parse_args()
 
-    server = Server(ws_port=args.port, web_port=args.web_port)
-    asyncio.run(server.run())
+    server = Server(port=args.port)
+    server.run()
 
 
 if __name__ == "__main__":

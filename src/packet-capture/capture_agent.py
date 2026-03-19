@@ -6,7 +6,10 @@ Aion 2 Packet Capture Agent (Windows)
 
 사용법:
   pip install scapy websockets psutil
-  python capture_agent.py --server ws://your-mac-server:8765
+  python capture_agent.py --server ws://your-mac-server:8080/capture
+
+외부 네트워크 (ngrok 터널):
+  python capture_agent.py --server wss://xxxx.ngrok-free.app/capture
 """
 
 import asyncio
@@ -225,9 +228,18 @@ class CaptureAgent:
                 await asyncio.sleep(1)
 
     async def _connect(self):
-        """WebSocket 서버에 접속"""
+        """WebSocket 서버에 접속 (ws:// 또는 wss:// 자동 처리)"""
         try:
-            self.ws = await websockets.connect(self.server_url)
+            extra = {}
+            if "ngrok" in self.server_url or "wss://" in self.server_url:
+                extra["additional_headers"] = {
+                    "ngrok-skip-browser-warning": "true"
+                }
+            self.ws = await websockets.connect(
+                self.server_url,
+                max_size=4 * 1024 * 1024,
+                **extra,
+            )
             logger.info(f"서버 연결 성공: {self.server_url}")
         except Exception as e:
             logger.error(f"서버 연결 실패: {e}")
@@ -295,8 +307,8 @@ def main():
     parser = argparse.ArgumentParser(description="Aion 2 Packet Capture Agent")
     parser.add_argument(
         "--server",
-        default="ws://localhost:8765",
-        help="WebSocket 서버 URL (기본: ws://localhost:8765)",
+        default="ws://localhost:8080/capture",
+        help="WebSocket 서버 URL (기본: ws://localhost:8080/capture)",
     )
     parser.add_argument(
         "--dump",

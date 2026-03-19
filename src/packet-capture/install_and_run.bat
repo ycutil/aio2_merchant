@@ -43,18 +43,19 @@ echo.
 echo [2/2] 설치 완료!
 echo.
 echo ============================================
-echo   Mac 서버 IP를 입력하세요
-echo   (예: 192.168.0.10)
+echo   서버 주소를 입력하세요
+echo.
+echo   같은 네트워크: ws://맥IP:8080/capture
+echo   외부 네트워크: wss://xxxx.ngrok-free.app/capture
 echo ============================================
-set /p SERVER_IP="Mac IP: "
+set /p SERVER_URL="서버 URL: "
 
 echo.
-echo 서버: ws://%SERVER_IP%:8765 로 연결합니다.
+echo 서버: %SERVER_URL% 로 연결합니다.
 echo Aion2를 실행한 상태에서 진행하세요.
 echo 종료: Ctrl+C
 echo.
 
-:: 관리자 권한으로 캡처 실행
-python capture_agent.py --server ws://%SERVER_IP%:8765
+python capture_agent.py --server %SERVER_URL%
 
 pause
