@@ -136,26 +136,23 @@ class CaptureAgent:
         if not payload:
             return
 
-        # 방향 확인 (S2C: 서버 → 클라이언트)
-        is_s2c = ip.src.startswith(GAME_SERVER_SUBNET) or tcp.sport == GAME_PORT
-
-        if not is_s2c:
+        # Capture both directions (S2C and C2S)
+        is_game = tcp.sport == GAME_PORT or tcp.dport == GAME_PORT
+        if not is_game:
             return
 
-        # TLS 필터링
-        if self.detector.is_tls(payload):
-            return
-
-        # 트래픽 감지
-        if not self.detector.is_locked():
-            if self.detector.check_magic(payload):
-                self.detector.register_candidate(
-                    tcp.sport, pkt.sniffed_on or "unknown"
-                )
-        elif not self.detector.matches(tcp.sport, tcp.dport):
-            return
-
+        # Log ALL packets for debug (first 20, then every 200)
         self.stats["captured"] += 1
+        n = self.stats["captured"]
+        was_tls = self.detector.is_tls(payload)
+        if n <= 20 or n % 200 == 0:
+            head = payload[:12].hex(' ')
+            logger.info(
+                f"[PKT] #{n} {ip.src}:{tcp.sport}->{ip.dst}:{tcp.dport} "
+                f"len={len(payload)} tls={was_tls} [{head}]"
+            )
+
+        # Send ALL packets — no TLS filter, let server analyze
         self.stats["frames"] += 1
         try:
             self.packet_queue.put_nowait(payload)
