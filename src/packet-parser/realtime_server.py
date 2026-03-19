@@ -42,78 +42,36 @@ MAGIC = bytes([0x06, 0x00, 0x36])
 
 
 class StreamFramer:
-    """Server-side VarInt length framing with 06 00 36 resync"""
+    """Server-side framing: split TCP stream by 06 00 36 delimiter"""
 
     def __init__(self):
         self.buf = bytearray()
-        self.synced = False
 
     def feed(self, data: bytes) -> list[bytes]:
         self.buf.extend(data)
         if len(self.buf) > 4 * 1024 * 1024:
             self.buf.clear()
-            self.synced = False
             return []
 
         frames = []
-
-        if not self.synced:
+        while True:
             idx = self.buf.find(MAGIC)
             if idx < 0:
-                if len(self.buf) > 2:
-                    self.buf = self.buf[-2:]
-                return []
-            # 06 00 36 is itself a VarInt(6) packet — consume it fully
-            # VarInt val=6, len=1, realLength=6+1-4=3, total=1+3=4
-            start = idx
-            self.buf = self.buf[start:]  # align to the 06 byte
-            self.synced = True
-
-        while len(self.buf) > 0:
-            vr = self._read_varint(0)
-            if vr is None:
                 break
 
-            var_val, var_len = vr
-            real_length = var_val + var_len - 4
+            # Everything before the delimiter is a frame
+            if idx > 2:
+                frames.append(bytes(self.buf[:idx]))
 
-            if real_length < 0 or real_length > 2 * 1024 * 1024:
-                # desync — scan for next 06 00 36
-                self.synced = False
-                idx = self.buf.find(MAGIC, 1)
-                if idx < 0:
-                    self.buf = self.buf[-2:] if len(self.buf) > 2 else self.buf
-                    break
-                self.buf = self.buf[idx:]
-                self.synced = True
-                continue
+            # Skip past the delimiter
+            self.buf = self.buf[idx + len(MAGIC):]
 
-            total = var_len + real_length
-            if total > len(self.buf):
-                break  # wait for more data
-
-            frame = bytes(self.buf[var_len:var_len + real_length])
-            self.buf = self.buf[total:]
-
-            if len(frame) >= 2:
-                frames.append(frame)
+        # Keep remaining data (incomplete frame)
+        # But cap it to prevent unbounded growth
+        if len(self.buf) > 256 * 1024:
+            self.buf = self.buf[-1024:]
 
         return frames
-
-    def _read_varint(self, offset: int):
-        value = 0
-        shift = 0
-        count = 0
-        while offset + count < len(self.buf):
-            b = self.buf[offset + count]
-            count += 1
-            value |= (b & 0x7F) << shift
-            if (b & 0x80) == 0:
-                return value, count
-            shift += 7
-            if shift > 35:
-                return None
-        return None
 
 
 class RealtimeAnalyzer:
