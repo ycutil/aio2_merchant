@@ -138,15 +138,22 @@ class CaptureAgent:
 
         # All traffic to/from game server subnet passes through
 
-        # Log ALL packets for debug (first 20, then every 200)
         self.stats["captured"] += 1
         n = self.stats["captured"]
-        was_tls = self.detector.is_tls(payload)
-        if n <= 20 or n % 200 == 0:
-            head = payload[:12].hex(' ')
+        # Tag packet source for easy filtering
+        if tcp.sport == 38600 or tcp.dport == 38600:
+            tag = "LOCAL"
+        elif tcp.sport == 13328 or tcp.dport == 13328:
+            tag = "KEEPALIVE"
+        elif tcp.sport == 443 or tcp.dport == 443:
+            tag = "TLS"
+        else:
+            tag = "OTHER"
+        if n <= 30 or n % 100 == 0 or tag in ("LOCAL", "OTHER"):
+            head = payload[:16].hex(' ')
             logger.info(
-                f"[PKT] #{n} {ip.src}:{tcp.sport}->{ip.dst}:{tcp.dport} "
-                f"len={len(payload)} tls={was_tls} [{head}]"
+                f"[{tag}] #{n} {ip.src}:{tcp.sport}->{ip.dst}:{tcp.dport} "
+                f"len={len(payload)} [{head}]"
             )
 
         # Send ALL packets — no TLS filter, let server analyze
@@ -250,8 +257,14 @@ class CaptureAgent:
         if not self._is_game_running():
             logger.warning("Aion2.exe 프로세스를 찾을 수 없음 — 대기 중")
 
-        # BPF: capture game data server + keepalive server
-        bpf = "tcp and (net 206.127.156.0/24 or host 209.35.114.66)"
+        # BPF: capture loopback (game local server) + game servers + TLS game servers
+        bpf = (
+            "tcp and ("
+            "port 38600 or port 37300"  # game local server + UDP relay
+            " or net 206.127.156.0/24"  # keepalive server
+            " or net 216.107.0.0/16"    # game data servers (TLS)
+            ")"
+        )
         logger.info(f"BPF filter: {bpf}")
 
         # 비동기 전송/통계 루프 시작
