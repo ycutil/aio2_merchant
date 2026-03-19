@@ -136,10 +136,7 @@ class CaptureAgent:
         if not payload:
             return
 
-        # Capture both directions (S2C and C2S)
-        is_game = tcp.sport == GAME_PORT or tcp.dport == GAME_PORT
-        if not is_game:
-            return
+        # All traffic to/from game server subnet passes through
 
         # Log ALL packets for debug (first 20, then every 200)
         self.stats["captured"] += 1
@@ -253,9 +250,9 @@ class CaptureAgent:
         if not self._is_game_running():
             logger.warning("Aion2.exe 프로세스를 찾을 수 없음 — 대기 중")
 
-        # BPF 필터
-        bpf = f"tcp and port {GAME_PORT}"
-        logger.info(f"BPF 필터: {bpf}")
+        # BPF: capture ALL TCP to/from game server subnet
+        bpf = f"tcp and net {GAME_SERVER_SUBNET}0/24"
+        logger.info(f"BPF filter: {bpf}")
 
         # 비동기 전송/통계 루프 시작
         tasks = [
