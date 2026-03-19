@@ -92,85 +92,30 @@ class TrafficDetector:
         return src_port == self.locked_port or dst_port == self.locked_port
 
 
-def read_varint(data: bytes, offset: int = 0):
-    """Protobuf VarInt (LEB128) decode — returns (value, bytes_consumed)"""
-    value = 0
-    shift = 0
-    count = 0
-    while offset + count < len(data):
-        byte_val = data[offset + count]
-        count += 1
-        value |= (byte_val & 0x7F) << shift
-        if (byte_val & 0x80) == 0:
-            return value, count
-        shift += 7
-        if shift > 35:
-            return None, 0
-    return None, 0  # incomplete
-
-
 class PacketBuffer:
-    """TCP stream buffer — VarInt length-based framing with 06 00 36 resync"""
+    """TCP stream buffer — split by 06 00 36 delimiter"""
 
     def __init__(self, max_size: int = 2 * 1024 * 1024):
         self.buffer = bytearray()
         self.max_size = max_size
-        self._synced = False
 
     def append(self, data: bytes):
         self.buffer.extend(data)
         if len(self.buffer) > self.max_size:
-            logger.warning("buffer overflow — reset")
             self.buffer.clear()
-            self._synced = False
-
-    def _try_sync(self):
-        """Find 06 00 36 marker to synchronize stream position"""
-        idx = self.buffer.find(MAGIC_BYTES)
-        if idx >= 0:
-            # Position right after the magic marker
-            self.buffer = self.buffer[idx + len(MAGIC_BYTES):]
-            self._synced = True
-            return True
-        # Keep last 2 bytes in case magic is split across TCP segments
-        if len(self.buffer) > 2:
-            self.buffer = self.buffer[-2:]
-        return False
 
     def extract_frames(self) -> list[bytes]:
         frames = []
-
-        if not self._synced:
-            if not self._try_sync():
-                return frames
-
-        while len(self.buffer) > 0:
-            # Read VarInt packet length
-            var_val, var_len = read_varint(self.buffer, 0)
-            if var_val is None or var_len == 0:
-                break  # incomplete varint
-
-            # TK formula: realLength = varIntValue + varIntEncodedLength - 4
-            real_length = var_val + var_len - 4
-            if real_length <= 0 or real_length > 1024 * 1024:
-                # Bad length — desync, try to resync
-                logger.debug(f"bad frame len={real_length}, resyncing")
-                self._synced = False
-                if not self._try_sync():
-                    break
-                continue
-
-            total = var_len + real_length
-            if total > len(self.buffer):
-                break  # incomplete packet, wait for more data
-
-            # Extract frame body (skip varint header)
-            frame = bytes(self.buffer[var_len:var_len + real_length])
-            self.buffer = self.buffer[total:]
-
-            if len(frame) >= 2:
-                frames.append(frame)
-
+        while True:
+            idx = self.buffer.find(MAGIC_BYTES)
+            if idx < 0:
+                break
+            if idx > 2:
+                frames.append(bytes(self.buffer[:idx]))
+            self.buffer = self.buffer[idx + 3:]
+        # prevent unbounded growth
+        if len(self.buffer) > 256 * 1024:
+            self.buffer = self.buffer[-1024:]
         return frames
 
 
@@ -237,12 +182,16 @@ class CaptureAgent:
 
         self.stats["captured"] += 1
 
-        # Raw TCP payload — framing is done server-side
-        try:
-            self.packet_queue.put_nowait(payload)
+        # Accumulate and split by 06 00 36
+        stream_key = f"{ip.src}:{tcp.sport}"
+        self.buffers[stream_key].append(payload)
+        frames = self.buffers[stream_key].extract_frames()
+        for frame in frames:
             self.stats["frames"] += 1
-        except asyncio.QueueFull:
-            self.stats["errors"] += 1
+            try:
+                self.packet_queue.put_nowait(frame)
+            except asyncio.QueueFull:
+                self.stats["errors"] += 1
 
     async def _send_loop(self):
         """프레임을 WebSocket으로 전송"""

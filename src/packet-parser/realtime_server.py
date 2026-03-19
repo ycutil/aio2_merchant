@@ -46,9 +46,21 @@ class StreamFramer:
 
     def __init__(self):
         self.buf = bytearray()
+        self.feed_count = 0
 
     def feed(self, data: bytes) -> list[bytes]:
         self.buf.extend(data)
+        self.feed_count += 1
+
+        # Debug: log every 50 feeds
+        if self.feed_count <= 10 or self.feed_count % 50 == 0:
+            magic_count = self.buf.count(MAGIC)
+            head = self.buf[:20].hex(' ') if self.buf else ''
+            logger.info(
+                f"[BUF] feed#{self.feed_count} +{len(data)}B "
+                f"total={len(self.buf)}B magics={magic_count} [{head}]"
+            )
+
         if len(self.buf) > 4 * 1024 * 1024:
             self.buf.clear()
             return []
@@ -59,17 +71,16 @@ class StreamFramer:
             if idx < 0:
                 break
 
-            # Everything before the delimiter is a frame
             if idx > 2:
                 frames.append(bytes(self.buf[:idx]))
 
-            # Skip past the delimiter
             self.buf = self.buf[idx + len(MAGIC):]
 
-        # Keep remaining data (incomplete frame)
-        # But cap it to prevent unbounded growth
         if len(self.buf) > 256 * 1024:
             self.buf = self.buf[-1024:]
+
+        if frames:
+            logger.info(f"[BUF] extracted {len(frames)} frames, sizes={[len(f) for f in frames[:5]]}")
 
         return frames
 
@@ -92,13 +103,16 @@ class RealtimeAnalyzer:
         self.broker_candidates: dict = {}
         self.web_clients: set[web.WebSocketResponse] = set()
 
-    def process_raw(self, timestamp: float, raw_tcp: bytes):
-        """Process raw TCP payload — does framing server-side"""
-        frames = self.framer.feed(raw_tcp)
-        for frame in frames:
-            self.stats["total_frames"] += 1
-            self.stats["last_packet_time"] = timestamp
-            self._parse_and_route(timestamp, frame)
+    def process_raw(self, timestamp: float, data: bytes):
+        """Process incoming data — each WebSocket message is one frame"""
+        if len(data) < 4:
+            return
+        # Skip bare magic markers
+        if data == MAGIC:
+            return
+        self.stats["total_frames"] += 1
+        self.stats["last_packet_time"] = timestamp
+        self._parse_and_route(timestamp, data)
 
     def _parse_and_route(self, timestamp: float, frame: bytes):
         parsed = parse_frame(frame)
