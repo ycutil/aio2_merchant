@@ -92,31 +92,7 @@ class TrafficDetector:
         return src_port == self.locked_port or dst_port == self.locked_port
 
 
-class PacketBuffer:
-    """TCP stream buffer — split by 06 00 36 delimiter"""
-
-    def __init__(self, max_size: int = 2 * 1024 * 1024):
-        self.buffer = bytearray()
-        self.max_size = max_size
-
-    def append(self, data: bytes):
-        self.buffer.extend(data)
-        if len(self.buffer) > self.max_size:
-            self.buffer.clear()
-
-    def extract_frames(self) -> list[bytes]:
-        frames = []
-        while True:
-            idx = self.buffer.find(MAGIC_BYTES)
-            if idx < 0:
-                break
-            if idx > 2:
-                frames.append(bytes(self.buffer[:idx]))
-            self.buffer = self.buffer[idx + 3:]
-        # prevent unbounded growth
-        if len(self.buffer) > 256 * 1024:
-            self.buffer = self.buffer[-1024:]
-        return frames
+### No client-side framing — raw TCP pipe to server ###
 
 
 class CaptureAgent:
@@ -181,17 +157,11 @@ class CaptureAgent:
             return
 
         self.stats["captured"] += 1
-
-        # Accumulate and split by 06 00 36
-        stream_key = f"{ip.src}:{tcp.sport}"
-        self.buffers[stream_key].append(payload)
-        frames = self.buffers[stream_key].extract_frames()
-        for frame in frames:
-            self.stats["frames"] += 1
-            try:
-                self.packet_queue.put_nowait(frame)
-            except asyncio.QueueFull:
-                self.stats["errors"] += 1
+        self.stats["frames"] += 1
+        try:
+            self.packet_queue.put_nowait(payload)
+        except asyncio.QueueFull:
+            self.stats["errors"] += 1
 
     async def _send_loop(self):
         """프레임을 WebSocket으로 전송"""

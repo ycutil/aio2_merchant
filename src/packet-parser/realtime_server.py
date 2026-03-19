@@ -41,46 +41,85 @@ logger = logging.getLogger("aion2-server")
 MAGIC = bytes([0x06, 0x00, 0x36])
 
 
+def _read_varint(buf, offset):
+    value = 0
+    shift = 0
+    count = 0
+    while offset + count < len(buf):
+        b = buf[offset + count]
+        count += 1
+        value |= (b & 0x7F) << shift
+        if (b & 0x80) == 0:
+            return value, count
+        shift += 7
+        if shift > 35:
+            return None, 0
+    return None, 0
+
+
 class StreamFramer:
-    """Server-side framing: split TCP stream by 06 00 36 delimiter"""
+    """Server-side TCP stream framing — tries multiple strategies"""
 
     def __init__(self):
         self.buf = bytearray()
         self.feed_count = 0
+        self.frame_count = 0
 
     def feed(self, data: bytes) -> list[bytes]:
         self.buf.extend(data)
         self.feed_count += 1
-
-        # Debug: log every 50 feeds
-        if self.feed_count <= 10 or self.feed_count % 50 == 0:
-            magic_count = self.buf.count(MAGIC)
-            head = self.buf[:20].hex(' ') if self.buf else ''
-            logger.info(
-                f"[BUF] feed#{self.feed_count} +{len(data)}B "
-                f"total={len(self.buf)}B magics={magic_count} [{head}]"
-            )
 
         if len(self.buf) > 4 * 1024 * 1024:
             self.buf.clear()
             return []
 
         frames = []
-        while True:
-            idx = self.buf.find(MAGIC)
-            if idx < 0:
+
+        # Strategy: try VarInt length framing
+        while len(self.buf) >= 4:
+            var_val, var_len = _read_varint(self.buf, 0)
+            if var_val is None or var_len == 0:
                 break
 
-            if idx > 2:
-                frames.append(bytes(self.buf[:idx]))
+            # Try multiple length formulas
+            # Formula A (TK): payload = var_val + var_len - 4, consumed = var_len + payload
+            payload_a = var_val + var_len - 4
+            total_a = var_len + payload_a
 
-            self.buf = self.buf[idx + len(MAGIC):]
+            if 2 <= payload_a <= 65536 and total_a <= len(self.buf):
+                frame = bytes(self.buf[var_len:var_len + payload_a])
+                self.buf = self.buf[total_a:]
+                if len(frame) >= 2:
+                    frames.append(frame)
+                    self.frame_count += 1
+                continue
 
-        if len(self.buf) > 256 * 1024:
-            self.buf = self.buf[-1024:]
+            # Formula B: payload = var_val, consumed = var_len + var_val
+            if 2 <= var_val <= 65536 and (var_len + var_val) <= len(self.buf):
+                frame = bytes(self.buf[var_len:var_len + var_val])
+                self.buf = self.buf[var_len + var_val:]
+                if len(frame) >= 2:
+                    frames.append(frame)
+                    self.frame_count += 1
+                continue
 
-        if frames:
-            logger.info(f"[BUF] extracted {len(frames)} frames, sizes={[len(f) for f in frames[:5]]}")
+            # Neither works — try resync on 06 00 36
+            idx = self.buf.find(MAGIC, 1)
+            if idx > 0:
+                self.buf = self.buf[idx:]
+                continue
+            else:
+                # Drop first byte and retry
+                self.buf = self.buf[1:]
+                continue
+
+        # Log periodically
+        if self.feed_count <= 5 or (frames and self.frame_count <= 30):
+            sizes = [len(f) for f in frames[:5]]
+            logger.info(
+                f"[FRAME] feed#{self.feed_count} +{len(data)}B "
+                f"buf={len(self.buf)}B frames={len(frames)} sizes={sizes}"
+            )
 
         return frames
 
@@ -104,15 +143,12 @@ class RealtimeAnalyzer:
         self.web_clients: set[web.WebSocketResponse] = set()
 
     def process_raw(self, timestamp: float, data: bytes):
-        """Process incoming data — each WebSocket message is one frame"""
-        if len(data) < 4:
-            return
-        # Skip bare magic markers
-        if data == MAGIC:
-            return
-        self.stats["total_frames"] += 1
-        self.stats["last_packet_time"] = timestamp
-        self._parse_and_route(timestamp, data)
+        """Process raw TCP data — server-side framing"""
+        frames = self.framer.feed(data)
+        for frame in frames:
+            self.stats["total_frames"] += 1
+            self.stats["last_packet_time"] = timestamp
+            self._parse_and_route(timestamp, frame)
 
     def _parse_and_route(self, timestamp: float, frame: bytes):
         parsed = parse_frame(frame)
@@ -199,6 +235,8 @@ class Server:
         self.port = port
         self.analyzer = RealtimeAnalyzer()
         self.capture_connected = False
+        self.msg_count = 0
+        self.msg_bytes = 0
 
     # ── /capture: 캡처 에이전트 WebSocket ──
 
@@ -211,19 +249,28 @@ class Server:
 
         try:
             async for msg in ws:
-                if msg.type == web.WSMsgType.BINARY and len(msg.data) > 8:
-                    timestamp = struct.unpack("<d", msg.data[:8])[0]
-                    raw_tcp = msg.data[8:]
-                    self.analyzer.process_raw(timestamp, raw_tcp)
-                elif msg.type == web.WSMsgType.TEXT:
-                    try:
-                        cmd = json.loads(msg.data)
-                        if cmd.get("type") == "event":
-                            self.analyzer.mark_event(cmd["event"])
-                    except json.JSONDecodeError:
-                        pass
-                elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR):
-                    break
+                self.msg_count += 1
+
+                # Accept both BINARY and TEXT
+                data = msg.data if msg.type == web.WSMsgType.BINARY else (
+                    msg.data.encode() if msg.type == web.WSMsgType.TEXT else None
+                )
+
+                if data is None or len(data) < 8:
+                    if self.msg_count <= 10:
+                        logger.info(f"[RECV] msg#{self.msg_count} type={msg.type} len={len(msg.data) if msg.data else 0} SKIP")
+                    continue
+
+                timestamp = struct.unpack("<d", data[:8])[0]
+                raw_tcp = data[8:]
+                self.msg_bytes += len(raw_tcp)
+
+                if self.msg_count <= 10 or self.msg_count % 200 == 0:
+                    logger.info(
+                        f"[RECV] msg#{self.msg_count} {len(raw_tcp)}B "
+                        f"head=[{raw_tcp[:20].hex(' ')}]"
+                    )
+                self.analyzer.process_raw(timestamp, raw_tcp)
         except Exception as e:
             logger.warning(f"캡처 에이전트 오류: {e}")
         finally:
@@ -254,6 +301,8 @@ class Server:
     async def handle_status(self, request):
         status = self.analyzer.get_status()
         status["capture_connected"] = self.capture_connected
+        status["raw_messages"] = self.msg_count
+        status["raw_bytes"] = self.msg_bytes
         return web.json_response(status)
 
     async def handle_packets(self, request):
