@@ -250,8 +250,8 @@ class CaptureAgent:
         if not self._is_game_running():
             logger.warning("Aion2.exe 프로세스를 찾을 수 없음 — 대기 중")
 
-        # BPF: capture ALL TCP to/from game server subnet
-        bpf = f"tcp and net {GAME_SERVER_SUBNET}0/24"
+        # BPF: capture game data server + keepalive server
+        bpf = "tcp and (net 206.127.156.0/24 or host 209.35.114.66)"
         logger.info(f"BPF filter: {bpf}")
 
         # 비동기 전송/통계 루프 시작
