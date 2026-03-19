@@ -262,13 +262,23 @@ class Server:
                     continue
 
                 timestamp = struct.unpack("<d", data[:8])[0]
-                raw_tcp = data[8:]
+                rest = data[8:]
+
+                # Detect format: 9-byte header (Frida) vs 8-byte header (old)
+                if len(rest) > 1 and rest[0] in (0, 1):
+                    # Frida format: 1B direction + payload
+                    direction = "S2C" if rest[0] == 0 else "C2S"
+                    raw_tcp = rest[1:]
+                else:
+                    direction = "S2C"
+                    raw_tcp = rest
+
                 self.msg_bytes += len(raw_tcp)
 
                 if self.msg_count <= 10 or self.msg_count % 200 == 0:
                     logger.info(
-                        f"[RECV] msg#{self.msg_count} {len(raw_tcp)}B "
-                        f"head=[{raw_tcp[:20].hex(' ')}]"
+                        f"[RECV] #{self.msg_count} {direction} {len(raw_tcp)}B "
+                        f"[{raw_tcp[:16].hex(' ')}]"
                     )
                 self.analyzer.process_raw(timestamp, raw_tcp)
         except Exception as e:
